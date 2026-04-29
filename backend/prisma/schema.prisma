@@ -1,0 +1,121 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  passwordHash  String
+  name          String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Monetization
+  credits       Int      @default(0)
+  stripeCustomerId String? @unique
+
+  // Relations
+  conversations Conversation[]
+  transactions  Transaction[]
+  memories      LongTermMemory[]
+
+  @@map("users")
+}
+
+model Conversation {
+  id        String   @id @default(uuid())
+  userId    String
+  title     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages  Message[]
+
+  @@index([userId])
+  @@map("conversations")
+}
+
+model Message {
+  id             String   @id @default(uuid())
+  conversationId String
+  role           MessageRole
+  content        String   @db.Text
+  tokensUsed     Int      @default(0)
+  creditsCharged Int      @default(0)
+  metadata       Json?
+  createdAt      DateTime @default(now())
+
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+  @@map("messages")
+}
+
+model LongTermMemory {
+  id          String   @id @default(uuid())
+  userId      String
+  content     String   @db.Text
+  summary     String?  @db.Text
+  vectorId    String?  @unique  // ID in Pinecone/Supabase Vector
+  importance  Float    @default(0.5)
+  category    String?  // e.g., "preference", "fact", "goal"
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("long_term_memories")
+}
+
+model Transaction {
+  id              String            @id @default(uuid())
+  userId          String
+  stripeSessionId String?           @unique
+  stripePaymentId String?           @unique
+  amount          Int               // in cents
+  currency        String            @default("usd")
+  creditsGranted  Int
+  status          TransactionStatus @default(PENDING)
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("transactions")
+}
+
+model CreditPlan {
+  id          String   @id @default(uuid())
+  name        String
+  credits     Int
+  priceUsd    Float
+  stripePriceId String @unique
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  @@map("credit_plans")
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REFUNDED
+}
