@@ -1,27 +1,41 @@
-import Stripe from 'stripe';
-import { config } from '../config/env';
+import crypto from 'crypto';
 import { db } from '../config/database';
 import { logger } from '../utils/logger';
 import { AppError } from '../middleware/errorHandler';
 
-const stripe = new Stripe(config.stripe.secretKey, {
-  apiVersion: '2024-06-20',
-  typescript: true,
-});
-
-// ── Credit packages available for purchase ───────────────────
+// ── Credit packages — map to your LemonSqueezy variant IDs ───
 export const CREDIT_PACKAGES = {
-  starter: { credits: 500, priceId: process.env.STRIPE_PRICE_STARTER!, usd: 9.99 },
-  pro:     { credits: 2000, priceId: process.env.STRIPE_PRICE_PRO!,     usd: 29.99 },
-  credits: { credits: 200,  priceId: process.env.STRIPE_PRICE_CREDITS!, usd: 4.99 },
+  starter: { credits: 500,  variantId: process.env.LS_VARIANT_STARTER!,  usd: 9.99  },
+  pro:     { credits: 2000, variantId: process.env.LS_VARIANT_PRO!,      usd: 29.99 },
+  credits: { credits: 200,  variantId: process.env.LS_VARIANT_CREDITS!,  usd: 4.99  },
 } as const;
 
 export type PackageName = keyof typeof CREDIT_PACKAGES;
 
+// ── LemonSqueezy API helper ───────────────────────────────────
+async function lsRequest<T>(path: string, method = 'GET', body?: object): Promise<T> {
+  const res = await fetch(`https://api.lemonsqueezy.com/v1${path}`, {
+    method,
+    headers: {
+      'Accept':        'application/vnd.api+json',
+      'Content-Type':  'application/vnd.api+json',
+      'Authorization': `Bearer ${process.env.LEMONSQUEEZY_API_KEY}`,
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new AppError(res.status, `LemonSqueezy error: ${JSON.stringify(err)}`);
+  }
+
+  return res.json() as Promise<T>;
+}
+
 // ── Billing Service ───────────────────────────────────────────
 class BillingService {
 
-  // ── Create Checkout Session ────────────────────────────────
+  // ── Create Checkout URL ────────────────────────────────────
   async createCheckoutSession(
     userId: string,
     email: string,
@@ -30,186 +44,140 @@ class BillingService {
     const pkg = CREDIT_PACKAGES[packageName];
     if (!pkg) throw new AppError(400, `Invalid package: ${packageName}`);
 
-    // Retrieve or create Stripe customer
-    const stripeCustomerId = await this.getOrCreateCustomer(userId, email);
+    const storeId  = process.env.LEMONSQUEEZY_STORE_ID!;
 
-    const session = await stripe.checkout.sessions.create({
-      customer: stripeCustomerId,
-      payment_method_types: ['card'],
-      mode: 'payment',
-      line_items: [{
-        price: pkg.priceId,
-        quantity: 1,
-      }],
-      success_url: `${config.server.frontendUrl}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${config.server.frontendUrl}/billing/cancelled`,
-      metadata: {
-        userId,
-        packageName,
-        creditsToAdd: String(pkg.credits),
+    const payload = {
+      data: {
+        type: 'checkouts',
+        attributes: {
+          checkout_data: {
+            email,
+            custom: { userId, packageName, creditsToAdd: String(pkg.credits) },
+          },
+          product_options: {
+            redirect_url:     `${process.env.FRONTEND_URL}/billing/success`,
+            receipt_link_url: `${process.env.FRONTEND_URL}/billing/success`,
+          },
+        },
+        relationships: {
+          store:   { data: { type: 'stores',   id: storeId              } },
+          variant: { data: { type: 'variants',  id: pkg.variantId       } },
+        },
       },
-    });
+    };
 
-    logger.info('Checkout session created', { userId, packageName, sessionId: session.id });
-    return session.url!;
-  }
-
-  // ── Create Billing Portal Session ─────────────────────────
-  async createPortalSession(userId: string): Promise<string> {
-    const user = await db.queryOne<{ stripe_customer_id: string }>(
-      'SELECT stripe_customer_id FROM users WHERE id = $1',
-      [userId]
+    const response = await lsRequest<{ data: { attributes: { url: string } } }>(
+      '/checkouts', 'POST', payload
     );
 
-    if (!user?.stripe_customer_id) {
-      throw new AppError(400, 'No billing account found. Purchase a plan first.');
-    }
-
-    const session = await stripe.billingPortal.sessions.create({
-      customer: user.stripe_customer_id,
-      return_url: `${config.server.frontendUrl}/dashboard/billing`,
-    });
-
-    return session.url;
+    logger.info('LemonSqueezy checkout created', { userId, packageName });
+    return response.data.attributes.url;
   }
 
-  // ── Process Stripe Webhook ─────────────────────────────────
+  // ── Process Webhook ────────────────────────────────────────
   async processWebhook(rawBody: Buffer, signature: string): Promise<void> {
-    let event: Stripe.Event;
+    // Verify HMAC-SHA256 signature
+    const secret  = process.env.LEMONSQUEEZY_WEBHOOK_SECRET!;
+    const digest  = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
 
-    try {
-      event = stripe.webhooks.constructEvent(
-        rawBody,
-        signature,
-        config.stripe.webhookSecret
-      );
-    } catch (err) {
-      logger.warn('Invalid webhook signature', { error: (err as Error).message });
+    if (digest !== signature) {
+      logger.warn('Invalid LemonSqueezy webhook signature');
       throw new AppError(400, 'Invalid webhook signature');
     }
 
-    logger.info('Stripe webhook received', { type: event.type, id: event.id });
+    const event = JSON.parse(rawBody.toString());
+    const eventName: string = event.meta?.event_name ?? '';
 
-    switch (event.type) {
-      case 'checkout.session.completed':
-        await this.handleCheckoutCompleted(event.data.object as Stripe.Checkout.Session);
+    logger.info('LemonSqueezy webhook received', { event: eventName });
+
+    switch (eventName) {
+      case 'order_created':
+        await this.handleOrderCreated(event);
         break;
-
-      case 'invoice.payment_succeeded':
-        await this.handleInvoicePaid(event.data.object as Stripe.Invoice);
+      case 'subscription_created':
+      case 'subscription_updated':
+        await this.handleSubscription(event);
         break;
-
-      case 'invoice.payment_failed':
-        await this.handlePaymentFailed(event.data.object as Stripe.Invoice);
+      case 'subscription_cancelled':
+        await this.handleSubscriptionCancelled(event);
         break;
-
-      case 'customer.subscription.deleted':
-        await this.handleSubscriptionCancelled(event.data.object as Stripe.Subscription);
-        break;
-
       default:
-        logger.debug('Unhandled webhook event', { type: event.type });
+        logger.debug('Unhandled webhook event', { event: eventName });
     }
   }
 
-  // ── Webhook Handlers ───────────────────────────────────────
-  private async handleCheckoutCompleted(session: Stripe.Checkout.Session): Promise<void> {
-    const { userId, creditsToAdd } = session.metadata ?? {};
+  // ── Order Created (one-time credit purchase) ───────────────
+  private async handleOrderCreated(event: Record<string, unknown>): Promise<void> {
+    const meta       = event.meta as Record<string, unknown>;
+    const customData = meta?.custom_data as Record<string, string> | undefined;
+    const attributes = (event.data as Record<string, unknown>)?.attributes as Record<string, unknown>;
+
+    const userId       = customData?.userId;
+    const creditsToAdd = parseInt(customData?.creditsToAdd ?? '0');
+    const orderId      = String((event.data as Record<string, unknown>)?.id ?? '');
+    const status       = attributes?.status as string;
+
     if (!userId || !creditsToAdd) {
-      logger.error('Missing metadata in checkout session', { sessionId: session.id });
+      logger.error('Missing custom_data in webhook', { event });
       return;
     }
 
-    const credits = parseInt(creditsToAdd);
+    // Only credit on paid orders
+    if (status !== 'paid') return;
 
     await db.transaction(async (client) => {
-      // Add credits
       await client.query(
         `UPDATE users SET credits = credits + $1, updated_at = NOW() WHERE id = $2`,
-        [credits, userId]
+        [creditsToAdd, userId]
       );
-
-      // Record transaction
       await client.query(
-        `INSERT INTO credit_transactions (user_id, amount, type, stripe_session_id, description)
-         VALUES ($1, $2, 'purchase', $3, $4)`,
-        [userId, credits, session.id, `Purchased ${credits} credits`]
+        `INSERT INTO credit_transactions (user_id, amount, type, description)
+         VALUES ($1, $2, 'purchase', $3)
+         ON CONFLICT DO NOTHING`,
+        [userId, creditsToAdd, `Purchased ${creditsToAdd} credits (order ${orderId})`]
       );
     });
 
-    logger.info('Credits added', { userId, credits, sessionId: session.id });
+    logger.info('Credits added via LemonSqueezy', { userId, creditsToAdd, orderId });
   }
 
-  private async handleInvoicePaid(invoice: Stripe.Invoice): Promise<void> {
-    const customerId = invoice.customer as string;
-    const user = await db.queryOne<{ id: string }>(
-      'SELECT id FROM users WHERE stripe_customer_id = $1',
-      [customerId]
+  // ── Subscription events ────────────────────────────────────
+  private async handleSubscription(event: Record<string, unknown>): Promise<void> {
+    const meta       = event.meta as Record<string, unknown>;
+    const customData = meta?.custom_data as Record<string, string> | undefined;
+    const attributes = (event.data as Record<string, unknown>)?.attributes as Record<string, string>;
+
+    const userId = customData?.userId;
+    const status = attributes?.status; // active | past_due | cancelled | etc.
+    if (!userId) return;
+
+    const tier = status === 'active' ? 'pro' : 'free';
+    await db.query(
+      `UPDATE users SET subscription_tier = $1, updated_at = NOW() WHERE id = $2`,
+      [tier, userId]
     );
 
-    if (!user) return;
+    logger.info('Subscription updated', { userId, status, tier });
+  }
+
+  private async handleSubscriptionCancelled(event: Record<string, unknown>): Promise<void> {
+    const meta       = event.meta as Record<string, unknown>;
+    const customData = meta?.custom_data as Record<string, string> | undefined;
+    const userId     = customData?.userId;
+    if (!userId) return;
 
     await db.query(
-      `INSERT INTO payment_events (user_id, stripe_event_type, amount_cents, stripe_invoice_id)
-       VALUES ($1, 'invoice.paid', $2, $3)
-       ON CONFLICT (stripe_invoice_id) DO NOTHING`,
-      [user.id, invoice.amount_paid, invoice.id]
-    );
-
-    logger.info('Invoice paid recorded', { userId: user.id, invoiceId: invoice.id });
-  }
-
-  private async handlePaymentFailed(invoice: Stripe.Invoice): Promise<void> {
-    const customerId = invoice.customer as string;
-    const user = await db.queryOne<{ id: string; email: string }>(
-      'SELECT id, email FROM users WHERE stripe_customer_id = $1',
-      [customerId]
-    );
-
-    if (!user) return;
-
-    logger.warn('Payment failed', { userId: user.id, email: user.email, invoiceId: invoice.id });
-    // TODO: trigger email notification
-  }
-
-  private async handleSubscriptionCancelled(sub: Stripe.Subscription): Promise<void> {
-    const customerId = sub.customer as string;
-    await db.query(
-      `UPDATE users SET subscription_tier = 'free', updated_at = NOW()
-       WHERE stripe_customer_id = $1`,
-      [customerId]
-    );
-    logger.info('Subscription cancelled', { customerId });
-  }
-
-  // ── Get or Create Stripe Customer ─────────────────────────
-  private async getOrCreateCustomer(userId: string, email: string): Promise<string> {
-    const user = await db.queryOne<{ stripe_customer_id: string | null }>(
-      'SELECT stripe_customer_id FROM users WHERE id = $1',
+      `UPDATE users SET subscription_tier = 'free', updated_at = NOW() WHERE id = $1`,
       [userId]
     );
-
-    if (user?.stripe_customer_id) return user.stripe_customer_id;
-
-    const customer = await stripe.customers.create({
-      email,
-      metadata: { userId },
-    });
-
-    await db.query(
-      'UPDATE users SET stripe_customer_id = $1 WHERE id = $2',
-      [customer.id, userId]
-    );
-
-    return customer.id;
+    logger.info('Subscription cancelled', { userId });
   }
 
-  // ── Get credit balance ─────────────────────────────────────
+  // ── Get balance ────────────────────────────────────────────
   async getBalance(userId: string): Promise<{ credits: number; transactions: unknown[] }> {
     const [user, transactions] = await Promise.all([
       db.queryOne<{ credits: number }>(
-        'SELECT credits FROM users WHERE id = $1',
-        [userId]
+        'SELECT credits FROM users WHERE id = $1', [userId]
       ),
       db.query(
         `SELECT amount, type, description, created_at
@@ -218,7 +186,6 @@ class BillingService {
         [userId]
       ),
     ]);
-
     return { credits: user?.credits ?? 0, transactions };
   }
 }

@@ -31,21 +31,6 @@ billingRoutes.post(
   }
 );
 
-// ── POST /api/billing/portal ──────────────────────────────────
-billingRoutes.post(
-  '/portal',
-  authenticate,
-  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    try {
-      const authReq = req as AuthenticatedRequest;
-      const url = await billingService.createPortalSession(authReq.user.id);
-      res.json({ url });
-    } catch (err) {
-      next(err);
-    }
-  }
-);
-
 // ── GET /api/billing/balance ──────────────────────────────────
 billingRoutes.get(
   '/balance',
@@ -61,14 +46,14 @@ billingRoutes.get(
   }
 );
 
-// ── POST /api/billing/webhook (Stripe — raw body) ────────────
+// ── POST /api/billing/webhook (LemonSqueezy — raw body) ───────
 billingRoutes.post(
   '/webhook',
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      const sig = req.headers['stripe-signature'];
+      const sig = req.headers['x-signature'];
       if (!sig || typeof sig !== 'string') {
-        res.status(400).json({ error: 'Missing stripe-signature header' });
+        res.status(400).json({ error: 'Missing x-signature header' });
         return;
       }
 

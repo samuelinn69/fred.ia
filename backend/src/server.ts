@@ -45,7 +45,7 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
-// ── Stripe webhook needs raw body ───────────────────────────
+// ── LemonSqueezy webhook needs raw body for HMAC verification ─
 app.use('/api/billing/webhook', express.raw({ type: 'application/json' }));
 
 // ── Body Parsers ─────────────────────────────────────────────

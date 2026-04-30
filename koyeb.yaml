@@ -1,0 +1,66 @@
+# ============================================================
+#  KOYEB DEPLOYMENT CONFIGURATION
+#  Documentación: https://www.koyeb.com/docs
+# ============================================================
+
+# ── Backend Service ──────────────────────────────────────────
+- name: ai-platform-backend
+  type: web
+  instance_type: free           # Plan gratuito de Koyeb
+  regions: [fra]                # Frankfurt (más cercano a España)
+  
+  git:
+    repository: github.com/TU_USUARIO/TU_REPO   # ← cambia esto
+    branch: main
+    build_command: cd backend && npm ci && npm run build
+    run_command:   cd backend && node dist/server.js
+
+  ports:
+    - port: 8000
+      protocol: http
+
+  health_checks:
+    - path: /api/health
+      port: 8000
+      interval: 30
+
+  env:
+    - key: NODE_ENV
+      value: production
+    - key: PORT
+      value: "8000"
+    # ── Las siguientes las pegas en el panel de Koyeb ─────────
+    # (NO las pongas aquí en texto plano — usa el panel web)
+    # DATABASE_URL         → conexión de Neon
+    # JWT_SECRET           → openssl rand -hex 64
+    # ANTHROPIC_API_KEY    → tu clave de Anthropic
+    # LEMONSQUEEZY_API_KEY
+    # LEMONSQUEEZY_STORE_ID
+    # LEMONSQUEEZY_WEBHOOK_SECRET
+    # LS_VARIANT_STARTER / PRO / CREDITS
+    # PINECONE_API_KEY
+    # PINECONE_INDEX
+    # FRONTEND_URL         → URL que te dé Koyeb para el frontend
+
+# ── Frontend Service ─────────────────────────────────────────
+- name: ai-platform-frontend
+  type: web
+  instance_type: free
+  regions: [fra]
+
+  git:
+    repository: github.com/TU_USUARIO/TU_REPO   # ← cambia esto
+    branch: main
+    build_command: cd frontend && npm ci && npm run build
+    run_command:   cd frontend && node .next/standalone/server.js
+
+  ports:
+    - port: 3000
+      protocol: http
+
+  env:
+    - key: NODE_ENV
+      value: production
+    - key: PORT
+      value: "3000"
+    # NEXT_PUBLIC_API_URL  → URL que te dé Koyeb para el backend
